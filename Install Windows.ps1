@@ -1,244 +1,5 @@
-# Self-elevate the script if required
-if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
-	if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
-		$CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments
-		Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine
-		Exit
-	}
-}
-
-$Host.UI.RawUI.WindowTitle = "Windows No USB"
-
-# Import Write-Menu at the end of the file
-$script = Get-Content -Path $MyInvocation.MyCommand.Path
-$startLine = ($script | Select-String -Pattern '<# ----- Write-Menu snippet starts here \(MIT license\)' | Select-Object -ExpandProperty LineNumber) - 1
-$script[$startLine..($script.Count)] -join "`n" | iex
-
-function PauseNul ($message = "Press any key to continue... ") {
-	Write-Host $message -NoNewLine
-	$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') | Out-Null
-}
-
-if ([System.Environment]::OSVersion.Version -le (New-Object System.Version "6.1")) {
-    Write-Host "This script is not supported on Windows 7, due to lack of proper image deployment support.
-You should upgrade to Windows 10 or 11, anything below is no longer supported.`n" -ForegroundColor Red
-	PauseNul "Press any key to exit... "
-	exit 1
-}
-
-if ($PSVersionTable.PSVersion.Major -lt 5 -or ($PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -lt 1)) {
-	Write-Host "This script is not compatible with PowerShell versions below 5.1.
-It is advised to update Windows with the WMF 5.1 update or upgrading to 10 or 11.`n" -ForegroundColor Yellow
-	PauseNul "Press any key to exit... "
-	exit 1
-}
-
-Write-Host "Choosing an ISO, ESD or WIM file to install with file picker..." -ForegroundColor Green
-
-Add-Type -AssemblyName System.Windows.Forms
-
-$filePicker = New-Object Windows.Forms.OpenFileDialog
-$filePicker.Title = "Pick a Windows image"
-$filePicker.InitialDirectory = "$env:userprofile\Downloads"
-$filePicker.Filter = "Image Files (*.iso; *.wim; *.esd)|*.iso;*.wim;*.esd|ISO Files (*.iso)|*.iso|Windows Imaging Format (*.wim)|*.wim|Electronic Software Delivery (*.esd)|*.esd"
-$filePicker.Multiselect = $false
-
-$filePickerResult = $filePicker.ShowDialog()
-
-if ($filePickerResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    $selectedFilePath = $filePicker.FileName
-    if ([System.IO.Path]::GetExtension($selectedFilePath) -eq ".iso") {
-		$iso = $true
-        try { Mount-DiskImage -ImagePath "$selectedFilePath"  | Out-Null }
-		catch {
-			Clear-Host
-			Write-Host "An error occured while trying to mount the ISO.`nError: $($Error[0].Exception.Message)`n" -ForegroundColor Red
-			PauseNul "Press any key to exit... "
-			exit 1
-		}
-		
-		$mountedDriveLetter = (Get-DiskImage -ImagePath "$selectedFilePath" | Get-Volume).DriveLetter
-
-		if (Test-Path "$mountedDriveLetter`:\sources\install.esd") {
-			$esdWimPath = "$mountedDriveLetter`:\sources\install.esd"
-		} elseif (Test-Path "$mountedDriveLetter`:\sources\install.wim") {
-			$esdWimPath = "$mountedDriveLetter`:\sources\install.wim"
-		} else {
-			Write-Host "The selected ISO does not seem to be a Windows ISO." -ForegroundColor Red
-			Write-Host "The ISO must contain either install.esd or install.wim in the 'sources' folder." -ForegroundColor Red
-			Write-Host "Currently, this script does not support swm (split images).`n" -ForegroundColor Red
-			PauseNul "Press any key to exit..."
-			Dismount-DiskImage -ImagePath "$selectedFilePath" -ErrorAction SilentlyContinue | Out-Null
-			exit 1
-		}
-    } else {
-		$iso = $false
-		$esdWimPath = $filePicker.FileName
-	}
-} else {exit}
-
-do {
-	Clear-Host
-	Write-Host "Enter a drive letter for a NTFS partition that currently exists."
-	Write-Host "You can't select a partition/drive letter with a Windows installation on it!`n"
-	Write-Host "If your drive is invalid or not NTFS, then this prompt will be repeated until it's valid.`n" -ForegroundColor Yellow
-	$driveLetter = Read-Host "Drive letter (single character, A-Z)"
-	$driveLetter = $driveLetter.Substring(0, 1)
-} until ($null -ne (Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue | Where-Object {$_.FileSystem -eq "NTFS"}))
-
-$drivePath = "$driveLetter`:"
-Clear-Host
-
-try {
-	$editions = Get-WindowsImage -ImagePath $esdWimPath
-} catch {
-	Write-Host "An error occured while trying to get the editions of the selected image!`n$($Error[0].Exception.Message)`n" -ForegroundColor Red
-	PauseNul "Press any key to exit... "
-	exit 1
-}
-
-<# if ($editions.ImageIndex -as [int]) {
-	$index = $editions.ImageIndex
-} else {
-	do {
-		Clear-Host
-		$Host.UI.RawUI.ForegroundColor= "Yellow"
-		$editions | Format-Table -AutoSize ImageDescription, ImageIndex, ImageName | Out-Host
-		$Host.UI.RawUI.ForegroundColor= "White"
-		$index = Read-Host "Enter the ImageIndex for the edition you want to use (one number)"
-		if ($index -notin $editions.ImageIndex) {
-			Clear-Host
-			Write-Host "Invalid ImageIndex. Please type one number from the table above." -ForegroundColor Red
-			Start-Sleep 1
-		}
-	} until ($index -in $editions.ImageIndex)
-} #>
-
-$result = Write-Menu -title "Select an edition of Windows" -Sort -Entries ($editions).ImageName
-$index = $editions | Where-Object { $_.ImageName -eq $result } | Select-Object -ExpandProperty ImageIndex
-
-Clear-Host
-
-try {
-	Write-Host "Applying image (installing/extracing Windows)...`n" -ForegroundColor Yellow
-	$applyImageCommand = Expand-WindowsImage -ImagePath "$esdWimPath" -ApplyPath "$drivePath\" -Index $index -LogLevel 2
-} catch {
-	Write-Host "`nSomething went wrong while trying to apply the Windows image!`nError: $($Error[0].Exception.Message)`nLog: $($applyImageCommand.LogPath)`n" -ForegroundColor Red
-	PauseNul "Press any key to exit..."
-}
-
-if (Test-Path "$drivePath\autounattend.xml") {
-	Write-Host "Applying unattend answer files...`n" -ForegroundColor Yellow
-	try {
-		Use-WindowsUnattend -Path "$drivePath\" -UnattendPath "$drivePath\autounattend.xml"
-		if (Test-Path $mountedDriveLetter`:\sources\`$OEM`$\`$`$\Setup\Scripts) {
-			Copy-Item "$mountedDriveLetter`:\sources\`$OEM`$\`$`$\Setup\Scripts\*" -Destination "\Windows\Setup\Scripts" -Recurse
-		}
-		Copy-Item "$mountedDriveLetter`:\autounattend.xml*" -Destination "$drivePath\Windows\Setup\Scripts" -Recurse
-	} catch {
-		Write-Host "Something went wrong while trying to apply the unattend answer files/scripts!`n$($Error[0].Exception.Message)`n" -ForegroundColor Red
-	}
-}
-
-if ($iso) {
-	Write-Host "Unmounting ISO...`n" -ForegroundColor Yellow
-	try {Dismount-DiskImage -ImagePath "$selectedFilePath"}
-	catch {Write-Host "Something went wrong while trying to unmount the ISO!`n$($Error[0].Exception.Message)`n" -ForegroundColor Red}
-}
-
-Write-Host "Adding new Windows installation to boot loader...`n" -ForegroundColor Yellow
-try {
-	bcdboot $drivePath\Windows | Out-Null
-} catch {
-	Write-Host "Something went wrong trying to add the Windows installation to the boot loader!`nError: $($Error[0].Exception.Message)`n" -ForegroundColor Red
-}
-
-Write-Host "Completed!`n" -ForegroundColor Green
-PauseNul "Press any key to exit... "
-exit
-
-<# ----- Write-Menu snippet starts here (MIT license)
-https://github.com/QuietusPlus/Write-Menu/blob/master/Write-Menu.ps1 #>
-
 function Write-Menu {
-    <#
-        .SYNOPSIS
-            Outputs a command-line menu which can be navigated using the keyboard.
-
-        .DESCRIPTION
-            Outputs a command-line menu which can be navigated using the keyboard.
-
-            * Automatically creates multiple pages if the entries cannot fit on-screen.
-            * Supports nested menus using a combination of hashtables and arrays.
-            * No entry / page limitations (apart from device performance).
-            * Sort entries using the -Sort parameter.
-            * -MultiSelect: Use space to check a selected entry, all checked entries will be invoked / returned upon confirmation.
-            * Jump to the top / bottom of the page using the "Home" and "End" keys.
-            * "Scrolling" list effect by automatically switching pages when reaching the top/bottom.
-            * Nested menu indicator next to entries.
-            * Remembers parent menus: Opening three levels of nested menus means you have to press "Esc" three times.
-
-            Controls             Description
-            --------             -----------
-            Up                   Previous entry
-            Down                 Next entry
-            Left / PageUp        Previous page
-            Right / PageDown     Next page
-            Home                 Jump to top
-            End                  Jump to bottom
-            Space                Check selection (-MultiSelect only)
-            Enter                Confirm selection
-            Esc / Backspace      Exit / Previous menu
-
-        .EXAMPLE
-            PS C:\>$menuReturn = Write-Menu -Title 'Menu Title' -Entries @('Menu Option 1', 'Menu Option 2', 'Menu Option 3', 'Menu Option 4')
-
-            Output:
-
-              Menu Title
-
-               Menu Option 1
-               Menu Option 2
-               Menu Option 3
-               Menu Option 4
-
-        .EXAMPLE
-            PS C:\>$menuReturn = Write-Menu -Title 'AppxPackages' -Entries (Get-AppxPackage).Name -Sort
-
-            This example uses Write-Menu to sort and list app packages (Windows Store/Modern Apps) that are installed for the current profile.
-
-        .EXAMPLE
-            PS C:\>$menuReturn = Write-Menu -Title 'Advanced Menu' -Sort -Entries @{
-                'Command Entry' = '(Get-AppxPackage).Name'
-                'Invoke Entry' = '@(Get-AppxPackage).Name'
-                'Hashtable Entry' = @{
-                    'Array Entry' = "@('Menu Option 1', 'Menu Option 2', 'Menu Option 3', 'Menu Option 4')"
-                }
-            }
-
-            This example includes all possible entry types:
-
-            Command Entry     Invoke without opening as nested menu (does not contain any prefixes)
-            Invoke Entry      Invoke and open as nested menu (contains the "@" prefix)
-            Hashtable Entry   Opened as a nested menu
-            Array Entry       Opened as a nested menu
-
-        .NOTES
-            Write-Menu by QuietusPlus (inspired by "Simple Textbased Powershell Menu" [Michael Albert])
-
-        .LINK
-            https://quietusplus.github.io/Write-Menu
-
-        .LINK
-            https://github.com/QuietusPlus/Write-Menu
-    #>
-
     [CmdletBinding()]
-
-    <#
-        Parameters
-    #>
-
     param(
         # Array or hashtable containing the menu entries
         [Parameter(Mandatory=$true, ValueFromPipeline = $true)]
@@ -749,3 +510,132 @@ function Write-Menu {
     } while ($inputLoop)
 }
 
+# Self-elevate the script if required
+if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+	if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
+		$CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments
+		Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine
+		Exit
+	}
+}
+
+$Host.UI.RawUI.WindowTitle = "Windows No USB"
+
+function PauseNul ($message = "Press any key to continue... ") {
+	Write-Host $message -NoNewLine
+	$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') | Out-Null
+}
+
+if ([System.Environment]::OSVersion.Version -le (New-Object System.Version "6.1")) {
+    Write-Host "This script is not supported on Windows 7, due to lack of proper image deployment support.
+You should upgrade to Windows 10 or 11, anything below is no longer supported.`n" -ForegroundColor Red
+	PauseNul "Press any key to exit... "
+	exit 1
+}
+
+if ($PSVersionTable.PSVersion.Major -lt 5 -or ($PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -lt 1)) {
+	Write-Host "This script is not compatible with PowerShell versions below 5.1.
+It is advised to update Windows with the WMF 5.1 update or upgrading to 10 or 11.`n" -ForegroundColor Yellow
+	PauseNul "Press any key to exit... "
+	exit 1
+}
+
+Write-Host "Choosing an ISO, ESD or WIM file to install with file picker..." -ForegroundColor Green
+
+Add-Type -AssemblyName System.Windows.Forms
+
+$filePicker = New-Object Windows.Forms.OpenFileDialog
+$filePicker.Title = "Pick a Windows image"
+$filePicker.InitialDirectory = "$env:userprofile\Downloads"
+$filePicker.Filter = "Image Files (*.iso; *.wim; *.esd)|*.iso;*.wim;*.esd|ISO Files (*.iso)|*.iso|Windows Imaging Format (*.wim)|*.wim|Electronic Software Delivery (*.esd)|*.esd"
+$filePicker.Multiselect = $false
+
+$filePickerResult = $filePicker.ShowDialog()
+
+try {
+    if ($filePickerResult -eq [System.Windows.Forms.DialogResult]::OK) { $selectedFilePath = $filePicker.FileName } else { exit }
+
+    do {
+        Clear-Host
+        Write-Host "Enter a drive letter for a NTFS partition that currently exists."
+        Write-Host "You can't select a partition/drive letter with a Windows installation on it!`n"
+        Write-Host "If your drive is invalid or not NTFS, then this prompt will be repeated until it's valid.`n" -ForegroundColor Yellow
+        $driveLetter = Read-Host "Drive letter (single character, A-Z)"
+        $driveLetter = $driveLetter.Substring(0, 1)
+    } until ($null -ne (Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue | Where-Object {$_.FileSystem -eq "NTFS"}))
+
+    $drivePath = "$driveLetter`:"
+    Clear-Host
+
+    # Mount ISO or set ESD/WIM path
+    if ([System.IO.Path]::GetExtension($selectedFilePath) -eq ".iso") {
+        try { Mount-DiskImage -ImagePath "$selectedFilePath"  | Out-Null } catch {
+            Clear-Host
+            Write-Host "An error occured while trying to mount the ISO.`nError: $($Error[0].Exception.Message)`n" -ForegroundColor Red
+            PauseNul "Press any key to exit... "
+            exit 1
+        }
+        
+        $mountedDriveLetter = (Get-DiskImage -ImagePath "$selectedFilePath" | Get-Volume).DriveLetter
+
+        if (Test-Path "$mountedDriveLetter`:\sources\install.esd") {
+            $esdWimPath = "$mountedDriveLetter`:\sources\install.esd"
+        } elseif (Test-Path "$mountedDriveLetter`:\sources\install.wim") {
+            $esdWimPath = "$mountedDriveLetter`:\sources\install.wim"
+        } else {
+            Clear-Host
+            Write-Host "The selected ISO does not seem to be a Windows ISO." -ForegroundColor Red
+            Write-Host "The ISO must contain either install.esd or install.wim in the 'sources' folder." -ForegroundColor Yellow
+            Write-Host "Currently, this script does not support swm (split images).`n" -ForegroundColor Yellow
+            PauseNul "Press any key to exit..."
+            exit 1
+        }
+    } else { $esdWimPath = $filePicker.FileName }
+
+    try {
+        $editions = Get-WindowsImage -ImagePath $esdWimPath
+    } catch {
+        Write-Host "An error occured while trying to get the editions of the selected image!`n$($Error[0].Exception.Message)`n" -ForegroundColor Red
+        PauseNul "Press any key to exit... "
+        exit 1
+    }
+
+    $result = Write-Menu -title "Select an edition of Windows" -Sort -Entries ($editions).ImageName
+    $index = $editions | Where-Object { $_.ImageName -eq $result } | Select-Object -ExpandProperty ImageIndex
+
+    Clear-Host
+
+    try {
+        Write-Host "Applying image (installing/extracing Windows)...`n" -ForegroundColor Yellow
+        $applyImageCommand = Expand-WindowsImage -ImagePath "$esdWimPath" -ApplyPath "$drivePath\" -Index $index -LogLevel 2
+    } catch {
+        Write-Host "`nSomething went wrong while trying to apply the Windows image!`nError: $($Error[0].Exception.Message)`nLog: $($applyImageCommand.LogPath)`n" -ForegroundColor Red
+        PauseNul "Press any key to exit..."
+    }
+
+    if (Test-Path "$drivePath\autounattend.xml") {
+        Write-Host "Applying unattend answer files...`n" -ForegroundColor Yellow
+        try {
+            Use-WindowsUnattend -Path "$drivePath\" -UnattendPath "$drivePath\autounattend.xml"
+            if (Test-Path $mountedDriveLetter`:\sources\`$OEM`$\`$`$\Setup\Scripts) {
+                Copy-Item "$mountedDriveLetter`:\sources\`$OEM`$\`$`$\Setup\Scripts\*" -Destination "\Windows\Setup\Scripts" -Recurse
+            }
+            Copy-Item "$mountedDriveLetter`:\autounattend.xml*" -Destination "$drivePath\Windows\Setup\Scripts" -Recurse
+        } catch {
+            Write-Host "Something went wrong while trying to apply the unattend answer files/scripts!`n$($Error[0].Exception.Message)`n" -ForegroundColor Red
+        }
+    }
+
+    Write-Host "Adding new Windows installation to boot loader..." -ForegroundColor Yellow
+    try {
+        bcdboot $drivePath\Windows | Out-Null
+    } catch {
+        Write-Host "Something went wrong trying to add the Windows installation to the boot loader!`nError: $($Error[0].Exception.Message)`n" -ForegroundColor Red
+    }
+
+    Write-Host "Completed!`n" -ForegroundColor Green
+    PauseNul "Press any key to exit... "
+    exit
+} finally {
+    Dismount-DiskImage -ImagePath "$selectedFilePath" -ErrorAction SilentlyContinue | Out-Null
+}
